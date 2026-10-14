@@ -1609,6 +1609,11 @@ export const messages = {
     'en-US':
       'This session was auto-restarted by GT Office. Follow your system prompt\'s session-boundary auto-restart guidance: check .claude/session-handoff/ and continue from the previous phase.',
   },
+  'system.sessionBoundaryResumeNudgeFailed': {
+    'zh-CN': '[系统] 会话已重启，但接续提示未能送出，请手动让 Agent 检查 .claude/session-handoff/ 接续工作。\n',
+    'en-US':
+      '[system] Session restarted, but the resume prompt could not be delivered. Ask the agent to check .claude/session-handoff/ and continue.\n',
+  },
   'system.killSkippedNoRuntime': {
     'zh-CN': '[系统] 当前为 Web 预览，未执行会话终止: {sessionId}\n',
     'en-US': '[system] skip kill in web preview: {sessionId}\n',

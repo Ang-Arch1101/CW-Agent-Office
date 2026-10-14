@@ -69,6 +69,8 @@ import {
   takeStationTerminalOutputFlushEntries,
   transitionAgentExecutionState,
   waitForStationTerminalFrameFlush,
+  waitForTerminalOutputQuiet,
+  hasCliPromptMarker,
   peekParkedStationTerminalHost,
   disposeParkedStationTerminalHost,
   disposeAllParkedStationTerminalHosts,
@@ -212,11 +214,19 @@ const SESSION_BOUNDARY_RECONCILIATION_POLL_MS = 5000
 // startup work (provider/MCP checks, etc.) to likely finish, then type an
 // explicit nudge — not a blank keystroke, since nothing guarantees a
 // contentless message reliably cues the system-prompt guidance to fire on
-// a model's very first turn. 2s is a pragmatic guess, not a readiness
-// signal: writing to the PTY always "succeeds" whether or not the target
-// CLI's own prompt loop has attached yet, so there's no accepted/rejected
-// signal here to retry on.
-const SESSION_BOUNDARY_RESTART_NUDGE_DELAY_MS = 2000
+// a model's very first turn. Writing to the PTY always "succeeds" whether or
+// not the target CLI's prompt loop has attached yet, so instead of a fixed
+// delay (a flat 2s used to silently lose the nudge whenever startup ran long,
+// e.g. with several MCP servers to connect) wait for the session's output to
+// show the CLI's prompt (or, failing that, enough output to rule out the
+// launching shell) and then settle — see waitForTerminalOutputQuiet.
+const SESSION_BOUNDARY_RESTART_PROMPT_PROBE_BYTES = 8192
+const SESSION_BOUNDARY_RESTART_NUDGE_PROMPT_SETTLE_MS = 500
+const SESSION_BOUNDARY_RESTART_NUDGE_MIN_WAIT_MS = 2000
+const SESSION_BOUNDARY_RESTART_NUDGE_QUIET_MS = 3000
+const SESSION_BOUNDARY_RESTART_NUDGE_MIN_FRAMES = 5
+const SESSION_BOUNDARY_RESTART_NUDGE_MAX_WAIT_MS = 30000
+const SESSION_BOUNDARY_RESTART_NUDGE_POLL_MS = 250
 
 function isTerminalSessionBindingInvalid(detail: string): boolean {
   return (
@@ -517,7 +527,7 @@ export function useShellTerminalController({
   >({})
   const stationUnreadDeltaRef = useRef<Record<string, number>>({})
   const protectedAgentSessionByStationRef = useRef<Record<string, string>>({})
-  const launchStationCliAgentRef = useRef<((stationId: string) => Promise<void>) | null>(null)
+  const launchStationCliAgentRef = useRef<((stationId: string) => Promise<string | null>) | null>(null)
 
   const protectStationAgentSession = useCallback(
     (stationId: string, sessionId: string | null | undefined) => {
@@ -4734,11 +4744,16 @@ export function useShellTerminalController({
   )
 
   // ── Launch station CLI agent ────────────────────────────────────────────
-  const launchStationCliAgent = useMemo(
-    () => async (stationId: string) => {
+  // Resolves to the terminal session a CLI was freshly launched in, or null
+  // when nothing new was launched (no station, launch failed, or the agent was
+  // already running). Callers that need to talk to the new CLI must use this
+  // id rather than re-reading stationTerminalsRef, which only catches up once
+  // React has rendered the launch's state updates.
+  const launchStationCliAgentSession = useMemo(
+    () => async (stationId: string): Promise<string | null> => {
       const station = stationsRef.current.find((entry) => entry.id === stationId)
       if (!station) {
-        return
+        return null
       }
       setActiveStationId(stationId)
       const currentSessionId = stationTerminalsRef.current[stationId]?.sessionId ?? null
@@ -4746,10 +4761,10 @@ export function useShellTerminalController({
       if (!currentSessionId || !launchCommand) {
         const sessionId = await launchToolProfileForStation(station)
         if (!sessionId) {
-          return
+          return null
         }
         await focusStationTerminal(stationId)
-        return
+        return sessionId
       }
 
       const processSnapshot = await inspectStationSessionProcesses(stationId, currentSessionId)
@@ -4757,16 +4772,16 @@ export function useShellTerminalController({
       if (agentRunning) {
         protectStationAgentSession(stationId, currentSessionId)
         await focusStationTerminal(stationId)
-        return
+        return null
       }
 
       const resetCwd = await resetStationTerminalToAgentWorkdir(stationId)
       if (!resetCwd) {
-        return
+        return null
       }
       const launchedInSession = await runStationTerminalCommand(stationId, launchCommand)
       if (!launchedInSession) {
-        return
+        return null
       }
       protectStationAgentSession(stationId, currentSessionId)
       // A CLI started inside an already-open terminal is a new agent session
@@ -4792,6 +4807,7 @@ export function useShellTerminalController({
         }
       }
       await focusStationTerminal(stationId)
+      return currentSessionId
     },
     [
       focusStationTerminal,
@@ -4804,7 +4820,13 @@ export function useShellTerminalController({
       setActiveStationId,
     ],
   )
-  launchStationCliAgentRef.current = launchStationCliAgent
+  launchStationCliAgentRef.current = launchStationCliAgentSession
+  const launchStationCliAgent = useCallback(
+    async (stationId: string) => {
+      await launchStationCliAgentSession(stationId)
+    },
+    [launchStationCliAgentSession],
+  )
 
   // ── Cleanup removed station runtime state ───────────────────────────────
   const cleanupRemovedStationRuntimeState = useCallback(
@@ -5229,19 +5251,68 @@ export function useShellTerminalController({
       try {
         appendStationTerminalOutput(stationId, t(locale, 'system.sessionBoundaryRestarting'))
         await forceCloseStationTerminalById(stationId, 'session-boundary-auto-restart')
-        await launchStationCliAgentRef.current?.(stationId)
-        await new Promise((resolve) => window.setTimeout(resolve, SESSION_BOUNDARY_RESTART_NUDGE_DELAY_MS))
-        console.debug('[session-boundary] sending resume nudge', { stationId })
-        const nudgeSent = await writeStationTerminalWithSubmit(
-          stationId,
-          t(locale, 'system.sessionBoundaryResumePrompt'),
-        )
+        const workspaceId = activeWorkspaceIdRef.current
+        const launchedSessionId = (await launchStationCliAgentRef.current?.(stationId)) ?? null
+        const readiness =
+          workspaceId && launchedSessionId
+            ? await waitForTerminalOutputQuiet({
+                // Reads the session the launch reported, not
+                // stationTerminalsRef — that ref may still hold the
+                // force-closed session until React renders the relaunch.
+                probe: async () => {
+                  if (
+                    activeWorkspaceIdRef.current !== workspaceId ||
+                    !stationsRef.current.some((entry) => entry.id === stationId)
+                  ) {
+                    return null
+                  }
+                  const snapshot = await desktopApi
+                    .terminalReadSnapshot(workspaceId, launchedSessionId, SESSION_BOUNDARY_RESTART_PROMPT_PROBE_BYTES)
+                    .catch(() => null)
+                  if (
+                    !snapshot ||
+                    !isMatchingTerminalWorkspaceSessionResponse(snapshot, workspaceId, launchedSessionId)
+                  ) {
+                    return null
+                  }
+                  const tail = decodeTerminalBase64Chunk(createTerminalChunkDecoder(), snapshot.chunk, false)
+                  return { seq: snapshot.currentSeq, promptVisible: hasCliPromptMarker(tail) }
+                },
+                sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
+                now: () => Date.now(),
+                promptSettleMs: SESSION_BOUNDARY_RESTART_NUDGE_PROMPT_SETTLE_MS,
+                minWaitMs: SESSION_BOUNDARY_RESTART_NUDGE_MIN_WAIT_MS,
+                quietMs: SESSION_BOUNDARY_RESTART_NUDGE_QUIET_MS,
+                minFramesForQuiet: SESSION_BOUNDARY_RESTART_NUDGE_MIN_FRAMES,
+                maxWaitMs: SESSION_BOUNDARY_RESTART_NUDGE_MAX_WAIT_MS,
+                pollMs: SESSION_BOUNDARY_RESTART_NUDGE_POLL_MS,
+              })
+            : 'unavailable'
+        // Only type into the exact session that was just launched: with no
+        // launched session, writeStationTerminalWithSubmit would open a bare
+        // shell and run the prompt as a command; after a tab/workspace switch
+        // it would land in whatever session is current now.
+        let nudgeSent = false
+        if (
+          readiness !== 'unavailable' &&
+          activeWorkspaceIdRef.current === workspaceId &&
+          stationTerminalsRef.current[stationId]?.sessionId === launchedSessionId
+        ) {
+          console.debug('[session-boundary] sending resume nudge', { stationId, readiness })
+          nudgeSent = await writeStationTerminalWithSubmit(
+            stationId,
+            t(locale, 'system.sessionBoundaryResumePrompt'),
+          )
+        }
         if (!nudgeSent) {
           // Not thrown by writeStationTerminalWithSubmit (e.g. the relaunch
           // above silently no-op'd and the terminal runtime isn't live) —
           // without this, the session sits idle with no first turn and the
           // unconditional log below would misleadingly read as success.
-          console.warn('[session-boundary] resume nudge not delivered', { stationId })
+          // Surface it in the card too: a DevTools-only warning is invisible
+          // to the user, who otherwise just sees an idle fresh session.
+          console.warn('[session-boundary] resume nudge not delivered', { stationId, readiness })
+          appendStationTerminalOutput(stationId, t(locale, 'system.sessionBoundaryResumeNudgeFailed'))
         }
         console.debug('[session-boundary] restart completed', { stationId })
       } catch (error) {
