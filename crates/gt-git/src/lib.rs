@@ -1090,7 +1090,7 @@ where
 
     fn reserve_hash_budget(hash_budget: &AtomicU64, requested: u64) -> bool {
         hash_budget
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(requested)
             })
             .is_ok()
